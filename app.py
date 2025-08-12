@@ -1,25 +1,39 @@
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-import io
-import base64
+import pandas as pd
+import requests
+from io import BytesIO
 import os
+import zipfile
+import tempfile
+from datetime import datetime
+import traceback
 
 # Define available templates
 TEMPLATES = {
     "dnm_pkg_lot": {
-        "path": "dnm_pkg_lot.jpg",
+        "path": "templates/dnm_pkg_lot.jpg",
         "name": "D&M Leasing Package",
         "price_coords": (150, 104),
         "description": "D&M Leasing template with red price box"
     },
     "base_1": {
-        "path": "Base_1.jpg", 
+        "path": "templates/Base_1.jpg", 
         "name": "Base Template 1",
         "price_coords": (200, 100),
         "description": "Basic template layout"
     }
 }
+
+# DEFAULT SETTINGS - These work 90% of the time
+DEFAULT_TEMPLATE = "dnm_pkg_lot"
+DEFAULT_CAR_SCALE = 1.6
+DEFAULT_X_POSITION = "center"
+DEFAULT_Y_POSITION = "bottom"
+DEFAULT_X_OFFSET = 0
+DEFAULT_Y_OFFSET = -50
+DEFAULT_ALPHA_THRESHOLD = 128
 
 def get_template_choices():
     """Get template choices for dropdown"""
@@ -33,12 +47,50 @@ def load_template(template_key):
             return Image.open(template_path)
     return None
 
+def download_image_from_url(url):
+    """Download image from URL and return as PIL Image"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        # Open image from bytes
+        img = Image.open(BytesIO(response.content))
+        
+        # Convert to RGBA if not already
+        if img.mode != 'RGBA':
+            # Check if it has transparency info
+            if img.mode == 'P' and 'transparency' in img.info:
+                img = img.convert('RGBA')
+            elif img.mode == 'LA':
+                img = img.convert('RGBA')
+            else:
+                # Create a version with white background removed (simple method)
+                img = img.convert('RGBA')
+                # Optional: try to make white pixels transparent
+                data = img.getdata()
+                new_data = []
+                for item in data:
+                    # Change all white (also consider off-white) pixels to transparent
+                    if item[0] > 240 and item[1] > 240 and item[2] > 240:
+                        new_data.append((255, 255, 255, 0))
+                    else:
+                        new_data.append(item)
+                img.putdata(new_data)
+        
+        return img
+    except Exception as e:
+        print(f"Error downloading image from {url}: {str(e)}")
+        return None
+
 def add_price_overlay(image, price_text, template_key):
     """Add price overlay to image based on template"""
     # Initialize warnings list to track defaults used
     warnings = []
     if not price_text or not price_text.strip():
-        return image
+        return image, warnings
     
     # Get template-specific price coordinates
     if template_key in TEMPLATES:
@@ -56,16 +108,36 @@ def add_price_overlay(image, price_text, template_key):
     # Try to load font, fallback to default
     font_used = "Unknown"
     try:
-        font_path = "/home/shahidmo/.local/share/fonts/montserrat/Montserrat.ttf"
+        # Try sharp-edged fonts in order of preference
+        font_paths = [
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-Bold.ttf",
+            "/System/Library/Fonts/Arial Black.ttf",
+            "/usr/share/fonts/truetype/arial/arialbd.ttf"
+        ]
+        
         font_size = 100
-        font = ImageFont.truetype(font_path, font_size)
-        font_used = f"Montserrat ({font_size}px)"
+        font = None
+        
+        for font_path in font_paths:
+            try:
+                if os.path.exists(font_path):
+                    font = ImageFont.truetype(font_path, font_size)
+                    font_used = f"{os.path.basename(font_path)} ({font_size}px)"
+                    break
+            except:
+                continue
+        
+        if font is None:
+            raise Exception("No sharp-edged fonts found")
+            
     except Exception as e:
-        # Fallback to default font if Montserrat not available
+        # Fallback to default font if no sharp fonts available
         try:
             font = ImageFont.load_default()
             font_used = "System Default Font"
-            warnings.append(f"⚠️ Montserrat font not found - using system default font")
+            warnings.append(f"⚠️ Sharp-edged fonts not found - using system default font")
         except:
             font = None
             font_used = "No Font Available"
@@ -75,7 +147,7 @@ def add_price_overlay(image, price_text, template_key):
         # Text styling - exactly from price_overlay_main.py
         text_color = (255, 255, 255)  # White
         stroke_color = (255, 255, 255)  # White stroke
-        stroke_width = 4
+        stroke_width = 3
         
         # Get text bounding box for centering
         bbox = draw.textbbox((0, 0), price_text, font=font)
@@ -101,6 +173,13 @@ def add_price_overlay(image, price_text, template_key):
 def get_car_bounds(car_image, alpha_threshold):
     """Get actual car boundaries (non-transparent pixels)"""
     car_array = np.array(car_image)
+    
+    # Handle images without alpha channel
+    if len(car_array.shape) < 3 or car_array.shape[2] < 4:
+        # No alpha channel, assume all pixels are opaque
+        height, width = car_array.shape[:2]
+        return 0, 0, width-1, height-1, width, height
+    
     alpha = car_array[:, :, 3]
     
     # Find non-transparent pixels
@@ -260,122 +339,385 @@ def place_car_on_background(
     except Exception as e:
         return None, f"Error: {str(e)}"
 
-def create_gradio_interface():
-    """Create the Gradio interface"""
+def process_single_car(car_image, price_text, template_key=None):
+    """Process a single car image with default settings"""
+    try:
+        # Use provided template or default
+        template_to_use = template_key if template_key else DEFAULT_TEMPLATE
+        
+        # Load template
+        background = load_template(template_to_use)
+        if background is None:
+            return None, "Error: Could not load template"
+        
+        # Convert background to RGB
+        background = background.convert('RGB')
+        
+        # Get car bounds
+        bounds = get_car_bounds(car_image, DEFAULT_ALPHA_THRESHOLD)
+        if bounds is None:
+            return None, "Could not find car boundaries"
+        
+        min_x, min_y, max_x, max_y, car_width, car_height = bounds
+        
+        # Calculate resize with default scale
+        base_width = int(background.size[0] * 0.6)
+        target_width = int(base_width * DEFAULT_CAR_SCALE)
+        aspect_ratio = car_width / car_height
+        target_height = int(target_width / aspect_ratio)
+        
+        scale_factor = target_width / car_width
+        new_car_width = int(car_image.size[0] * scale_factor)
+        new_car_height = int(car_image.size[1] * scale_factor)
+        
+        car_resized = car_image.resize((new_car_width, new_car_height), Image.Resampling.LANCZOS)
+        
+        # Get new bounds after resize
+        new_bounds = get_car_bounds(car_resized, DEFAULT_ALPHA_THRESHOLD)
+        if new_bounds is None:
+            return None, "Could not find car boundaries after resize"
+        
+        new_min_x, new_min_y, new_max_x, new_max_y, new_car_width, new_car_height = new_bounds
+        
+        # Calculate position with defaults
+        if DEFAULT_X_POSITION == 'center':
+            paste_x = (background.size[0] - new_car_width) // 2 - new_min_x
+        
+        if DEFAULT_Y_POSITION == 'bottom':
+            paste_y = background.size[1] - new_max_y - 50
+        
+        # Apply default offsets
+        paste_x += DEFAULT_X_OFFSET
+        paste_y += DEFAULT_Y_OFFSET
+        
+        # Create composite
+        composite = background.copy()
+        composite.paste(car_resized, (paste_x, paste_y), car_resized)
+        
+        # Add price overlay if price text is provided
+        if price_text and price_text.strip():
+            composite, _ = add_price_overlay(composite, price_text, template_to_use)
+        
+        return composite, "Success"
+        
+    except Exception as e:
+        return None, f"Error: {str(e)}"
+
+def process_bulk_csv(csv_file, progress=gr.Progress()):
+    """Process multiple cars from CSV file with default settings"""
+    if csv_file is None:
+        return None, "Please upload a CSV file"
     
-    with gr.Blocks(title="Car Placement Tool") as demo:
-        gr.Markdown("# 🚗 Car Placement Tool")
-        gr.Markdown("Upload a transparent car image and select a template to place the car.")
+    try:
+        # Read CSV
+        df = pd.read_csv(csv_file.name)
         
-        with gr.Row():
-            # Left Column - Input Images
-            with gr.Column(scale=1):
-                gr.Markdown("### Input Images")
-                car_input = gr.Image(
-                    label="Car Image (PNG/WebP/AVIF with transparency)", 
-                    type="pil",
-                    image_mode=None,
-                    sources=["upload", "clipboard"],
-                    elem_id="car_input"
-                )
+        # Check required columns (case-insensitive)
+        df.columns = df.columns.str.strip()
+        required_cols = ['car url', 'price']
+        
+        # Find matching columns (case-insensitive)
+        found_cols = {}
+        for req_col in required_cols:
+            for col in df.columns:
+                if col.lower() == req_col.lower():
+                    found_cols[req_col] = col
+                    break
+        
+        if len(found_cols) != len(required_cols):
+            missing = [col for col in required_cols if col not in found_cols]
+            return None, f"CSV must contain columns: {', '.join(missing)}"
+        
+        # Create temporary directory for processing
+        temp_dir = tempfile.mkdtemp()
+        output_files = []
+        results_data = []
+        
+        try:
+            # Process each row
+            total_rows = len(df)
+            for idx, row in df.iterrows():
+                progress((idx + 1) / total_rows, f"Processing car {idx + 1} of {total_rows}")
                 
-                template_dropdown = gr.Dropdown(
-                    choices=get_template_choices(),
-                    value="dnm_pkg_lot",
-                    label="Select Template",
-                    info="Choose a background template"
-                )
+                car_url = row[found_cols['car url']]
+                price = row[found_cols['price']]
                 
-                template_preview = gr.Image(
-                    label="Template Preview",
-                    type="pil",
-                    height=150,
-                    interactive=False
-                )
+                # Skip empty rows
+                if pd.isna(car_url) or str(car_url).strip() == '':
+                    results_data.append({
+                        'index': idx + 1,
+                        'car_url': car_url,
+                        'price': price,
+                        'status': 'Skipped - Empty URL',
+                        'filename': ''
+                    })
+                    continue
                 
-                price_input = gr.Textbox(
-                    label="Price (optional)",
-                    placeholder="e.g., $426",
-                    value="",
-                    info="Add price overlay to template"
-                )
-                
-            # Right Column - Output and Controls
-            with gr.Column(scale=1):
-                output_image = gr.Image(
-                    label="Generated Image", 
-                    type="pil",
-                    height=400
-                )
-                
-                gr.Markdown("### Positioning Controls")
-                
-                car_scale = gr.Slider(
-                    minimum=0.1, 
-                    maximum=3.0, 
-                    value=1.6, 
-                    step=0.1,
-                    label="Car Scale"
-                )
-                
-                with gr.Row():
-                    x_position = gr.Radio(
-                        choices=['left', 'center', 'right'],
-                        value='center',
-                        label="X Position"
+                try:
+                    # Download car image
+                    car_image = download_image_from_url(str(car_url).strip())
+                    if car_image is None:
+                        results_data.append({
+                            'index': idx + 1,
+                            'car_url': car_url,
+                            'price': price,
+                            'status': 'Failed - Could not download image',
+                            'filename': ''
+                        })
+                        continue
+                    
+                    # Process the car with default settings
+                    result_image, status = process_single_car(
+                        car_image,
+                        str(price) if not pd.isna(price) else ""
                     )
-                    y_position = gr.Radio(
-                        choices=['top', 'center', 'bottom'],
-                        value='bottom',
-                        label="Y Position"
-                    )
-                
-                with gr.Row():
-                    x_offset = gr.Slider(
-                        minimum=-500, 
-                        maximum=500, 
-                        value=0, 
-                        step=10,
-                        label="X Offset"
-                    )
-                    y_offset = gr.Slider(
-                        minimum=-500, 
-                        maximum=500, 
-                        value=-50, 
-                        step=10,
-                        label="Y Offset"
-                    )
-                
-                alpha_threshold = gr.Slider(
-                    minimum=0, 
-                    maximum=255, 
-                    value=128, 
-                    step=1,
-                    label="Alpha Threshold",
-                    info="Threshold for detecting car boundaries"
-                )
-                
-        # Bottom - Process button and info
-        with gr.Row():
-            process_btn = gr.Button("Place Car", variant="primary", size="lg")
+                    
+                    if result_image:
+                        # Save the image
+                        filename = f"car_{idx + 1:04d}.jpg"
+                        filepath = os.path.join(temp_dir, filename)
+                        result_image.save(filepath, 'JPEG', quality=95)
+                        output_files.append((filepath, filename))
+                        
+                        results_data.append({
+                            'index': idx + 1,
+                            'car_url': car_url,
+                            'price': price,
+                            'status': 'Success',
+                            'filename': filename
+                        })
+                    else:
+                        results_data.append({
+                            'index': idx + 1,
+                            'car_url': car_url,
+                            'price': price,
+                            'status': f'Failed - {status}',
+                            'filename': ''
+                        })
+                        
+                except Exception as e:
+                    results_data.append({
+                        'index': idx + 1,
+                        'car_url': car_url,
+                        'price': price,
+                        'status': f'Error - {str(e)}',
+                        'filename': ''
+                    })
             
-        with gr.Row():
-            info_text = gr.Textbox(label="Info", lines=3)
+            # Create results CSV
+            results_df = pd.DataFrame(results_data)
+            results_csv_path = os.path.join(temp_dir, 'processing_results.csv')
+            results_df.to_csv(results_csv_path, index=False)
+            
+            # Create ZIP file in current directory (not temp dir)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_filename = f"car_images_{timestamp}.zip"
+            zip_path = os.path.abspath(zip_filename)  # Create in current directory
+            
+            with zipfile.ZipFile(zip_path, 'w') as zipf:
+                # Add all processed images
+                for filepath, arcname in output_files:
+                    zipf.write(filepath, arcname)
+                # Add results CSV
+                zipf.write(results_csv_path, 'processing_results.csv')
+            
+            # Generate summary
+            success_count = len([r for r in results_data if r['status'] == 'Success'])
+            failed_count = len([r for r in results_data if r['status'] != 'Success'])
+            
+            summary = f"Processing Complete!\n\n"
+            summary += f"Total processed: {total_rows}\n"
+            summary += f"Successful: {success_count}\n"
+            summary += f"Failed/Skipped: {failed_count}\n\n"
+            summary += f"Download the ZIP file below to get all images and results."
+            
+            return zip_path, summary
+            
+        finally:
+            # Clean up temp directory
+            import shutil
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass  # Ignore cleanup errors
+            
+    except Exception as e:
+        return None, f"Error processing CSV: {str(e)}\n{traceback.format_exc()}"
+
+def create_unified_interface():
+    """Create the unified Gradio interface with both single and bulk processing"""
+    
+    with gr.Blocks(title="Car Placement Tool", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("# 🚗 Car Placement Tool")
+        gr.Markdown("Place transparent car images on marketing templates. Choose between single image processing or bulk CSV processing.")
         
-        # Add examples
-        gr.Markdown("### Tips")
-        gr.Markdown("""
-        - **Car Image**: Supports PNG, WebP, AVIF with transparent backgrounds (RGBA format)
-        - **Background**: Supports JPEG, PNG, WebP, AVIF
-        - **Scale**: Adjust the size of the car relative to the background
-        - **Position**: Choose base position, then fine-tune with offsets
-        - **Alpha Threshold**: Lower values include more semi-transparent pixels
-        - **Formats**: WebP and AVIF offer better compression while maintaining transparency
-        """)
+        with gr.Tabs():
+            # Single Image Processing Tab
+            with gr.TabItem("Single Image", elem_id="single_tab"):
+                gr.Markdown("### Upload a transparent car image and customize placement")
+                
+                with gr.Row():
+                    # Left Column - Input Images
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### Input Images")
+                        car_input = gr.Image(
+                            label="Car Image (PNG/WebP/AVIF with transparency)", 
+                            type="pil",
+                            image_mode=None,
+                            sources=["upload", "clipboard"],
+                            elem_id="car_input"
+                        )
+                        
+                        template_dropdown = gr.Dropdown(
+                            choices=get_template_choices(),
+                            value="dnm_pkg_lot",
+                            label="Select Template",
+                            info="Choose a background template"
+                        )
+                        
+                        template_preview = gr.Image(
+                            label="Template Preview",
+                            type="pil",
+                            height=150,
+                            interactive=False
+                        )
+                        
+                        price_input = gr.Textbox(
+                            label="Price (optional)",
+                            placeholder="e.g., $426",
+                            value="",
+                            info="Add price overlay to template"
+                        )
+                        
+                    # Right Column - Output and Controls
+                    with gr.Column(scale=1):
+                        output_image = gr.Image(
+                            label="Generated Image", 
+                            type="pil",
+                            height=400
+                        )
+                        
+                        gr.Markdown("#### Positioning Controls")
+                        
+                        car_scale = gr.Slider(
+                            minimum=0.1, 
+                            maximum=3.0, 
+                            value=1.6, 
+                            step=0.1,
+                            label="Car Scale"
+                        )
+                        
+                        with gr.Row():
+                            x_position = gr.Radio(
+                                choices=['left', 'center', 'right'],
+                                value='center',
+                                label="X Position"
+                            )
+                            y_position = gr.Radio(
+                                choices=['top', 'center', 'bottom'],
+                                value='bottom',
+                                label="Y Position"
+                            )
+                        
+                        with gr.Row():
+                            x_offset = gr.Slider(
+                                minimum=-500, 
+                                maximum=500, 
+                                value=0, 
+                                step=10,
+                                label="X Offset"
+                            )
+                            y_offset = gr.Slider(
+                                minimum=-500, 
+                                maximum=500, 
+                                value=-50, 
+                                step=10,
+                                label="Y Offset"
+                            )
+                        
+                        alpha_threshold = gr.Slider(
+                            minimum=0, 
+                            maximum=255, 
+                            value=128, 
+                            step=1,
+                            label="Alpha Threshold",
+                            info="Threshold for detecting car boundaries"
+                        )
+                
+                # Bottom - Process button and info
+                with gr.Row():
+                    process_btn = gr.Button("Place Car", variant="primary", size="lg")
+                    
+                with gr.Row():
+                    info_text = gr.Textbox(label="Info", lines=3)
+            
+            # Bulk Processing Tab
+            with gr.TabItem("Bulk Processing", elem_id="bulk_tab"):
+                gr.Markdown("### Process multiple cars from a CSV file")
+                gr.Markdown("Upload a CSV with car URLs and prices. All images will be processed with optimized default settings.")
+                
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("#### CSV Format")
+                        gr.Markdown("""
+                        Your CSV should have two columns:
+                        ```
+                        Car URL,Price
+                        https://example.com/car1.png,$25,999
+                        https://example.com/car2.png,$32,500
+                        ```
+                        
+                        **Important:** Use "Copy image address" when right-clicking on car images to get the direct image URL.
+                        """)
+                        
+                        csv_input = gr.File(
+                            label="Upload CSV File",
+                            file_types=[".csv"],
+                            type="filepath"
+                        )
+                        
+                        process_bulk_btn = gr.Button("Process All Cars", variant="primary", size="lg")
+                        
+                    with gr.Column():
+                        gr.Markdown("#### Results")
+                        output_file = gr.File(
+                            label="Download Results (ZIP)",
+                            visible=True
+                        )
+                        summary_text = gr.Textbox(
+                            label="Processing Summary",
+                            lines=6,
+                            interactive=False
+                        )
+                
+                # Sample CSV download
+                with gr.Accordion("Download Sample CSV", open=False):
+                    sample_btn = gr.Button("Create Sample CSV")
+                    sample_file = gr.File(label="Sample CSV", visible=False)
+                    
+                    def create_sample_csv():
+                        sample_data = {
+                            'Car URL': [
+                                'https://example.com/car1.png',
+                                'https://example.com/car2.png',
+                                'https://example.com/car3.png'
+                            ],
+                            'Price': ['$25,999', '$32,500', '$28,750']
+                        }
+                        df = pd.DataFrame(sample_data)
+                        temp_path = "sample_car_urls.csv"
+                        df.to_csv(temp_path, index=False)
+                        return gr.File(value=temp_path, visible=True)
+                    
+                    sample_btn.click(
+                        fn=create_sample_csv,
+                        outputs=[sample_file]
+                    )
         
-        # Add format info
-        with gr.Accordion("Supported Image Formats", open=False):
+        # Documentation Tab
+        with gr.Accordion("Tips & Documentation", open=False):
             gr.Markdown("""
+            ### Supported Image Formats
             **Car Image (with transparency):**
             - **PNG**: Classic format with full alpha channel support
             - **WebP**: Modern format with better compression and transparency
@@ -385,7 +727,15 @@ def create_gradio_interface():
             **Background Image:**
             - All common formats: JPEG, PNG, WebP, AVIF, BMP, etc.
             
-            **Error Handling**: The tool will show a clear error if you upload a car image without transparency.
+            ### Usage Tips
+            - **Car Image**: Must have transparent backgrounds (RGBA format)
+            - **Scale**: Adjust the size of the car relative to the background
+            - **Position**: Choose base position, then fine-tune with offsets
+            - **Alpha Threshold**: Lower values include more semi-transparent pixels
+            - **Bulk Processing**: Uses optimized defaults that work 90% of the time
+            
+            ### Error Handling
+            The tool will show clear errors if you upload incompatible images or formats.
             """)
         
         # Function to update template preview
@@ -410,7 +760,7 @@ def create_gradio_interface():
             outputs=[template_preview]
         )
         
-        # Wire up the processing
+        # Wire up the single image processing
         process_btn.click(
             fn=place_car_on_background,
             inputs=[
@@ -427,7 +777,7 @@ def create_gradio_interface():
             outputs=[output_image, info_text]
         )
         
-        # Auto-process on parameter change (optional)
+        # Auto-process on parameter change for single image
         for input_component in [car_scale, x_position, y_position, x_offset, y_offset, alpha_threshold, template_dropdown, price_input]:
             input_component.change(
                 fn=place_car_on_background,
@@ -444,72 +794,24 @@ def create_gradio_interface():
                 ],
                 outputs=[output_image, info_text]
             )
+        
+        # Wire up the bulk processing
+        process_bulk_btn.click(
+            fn=process_bulk_csv,
+            inputs=[csv_input],
+            outputs=[output_file, summary_text]
+        )
     
     return demo
 
-# Alternative: Handle transparency preservation with custom preprocessing
-def preserve_transparency_interface():
-    """Alternative interface with custom image handling for multiple formats"""
-    
-    def process_with_preserved_alpha(car_file, background_file, *args):
-        """Process files while preserving alpha channel"""
-        if car_file is None or background_file is None:
-            return None, "Please upload both images"
-        
-        try:
-            # Read car image carefully to preserve alpha
-            car_image = Image.open(car_file)
-            
-            # Handle different formats
-            if car_image.mode == 'RGBA':
-                pass  # Already good
-            elif car_image.mode == 'LA':
-                # Grayscale with alpha - convert to RGBA
-                car_image = car_image.convert('RGBA')
-            elif car_image.mode == 'P':
-                # Palette mode - check for transparency
-                if 'transparency' in car_image.info:
-                    car_image = car_image.convert('RGBA')
-                else:
-                    raise ValueError("Car image must have transparency. The uploaded palette image doesn't have transparent pixels.")
-            else:
-                # No alpha channel
-                raise ValueError(f"Car image must have transparency (alpha channel). Uploaded image is in '{car_image.mode}' mode. Please use PNG, WebP, or AVIF with transparent background.")
-            
-            # Read background
-            background_image = Image.open(background_file)
-            
-            # Process with main function
-            return place_car_on_background(car_image, background_image, *args)
-        except Exception as e:
-            return None, f"Error loading images: {str(e)}"
-    
-    with gr.Blocks(title="Car Placement Tool") as demo:
-        gr.Markdown("# 🚗 Car Placement Tool (File Upload Version)")
-        gr.Markdown("Supports PNG, WebP, AVIF with transparency")
-        
-        with gr.Row():
-            car_file = gr.File(
-                label="Car Image", 
-                file_types=[".png", ".webp", ".avif", ".jpg", ".jpeg"]
-            )
-            background_file = gr.File(
-                label="Background Image", 
-                file_types=[".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp"]
-            )
-        
-        # ... (rest of the controls remain the same)
-        
-    return demo
-
-# Launch the main interface
+# Launch the unified interface
 if __name__ == "__main__":
-    demo = create_gradio_interface()
+    demo = create_unified_interface()
+    # Use PORT environment variable for Railway deployment, fallback to 5000
+    port = int(os.environ.get("PORT", 5000))
     demo.launch(
-        share=True,  # Creates a public link to share with your team
-        debug=True,
+        share=False,  # Set to True to create public link
+        debug=False,  # Disable debug in production
         server_name="0.0.0.0",  # Allow access from other machines
-        server_port=7860
+        server_port=port
     )
-    
-    
